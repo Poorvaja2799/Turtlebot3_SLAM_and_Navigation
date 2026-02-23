@@ -20,16 +20,18 @@ class RotateRobot(Node):
         super().__init__('minimal_publisher')
         self.declare_parameter('publish_frequency', 40) # in Hz
         self.declare_parameter('distance_setpoint', 1.0) # in meters?
+        self.declare_parameter('max_speed_r', 1.5)
+        self.declare_parameter('max_speed_t', 0.1)
         # rotational PID constants
-        self.declare_parameter('kp_r', hmmm)
-        self.declare_parameter('ki_r', uhhhh)
-        self.declare_parameter('kd_r', sdkfj)
+        self.declare_parameter('kp_r', 0.7)
+        self.declare_parameter('ki_r', 0.0)
+        self.declare_parameter('kd_r', 0.0)
         # translational PID constants
-        self.declare_parameter('kp_t', djfj)
-        self.declare_parameter('ki_t', fjf)
-        self.declare_parameter('kd_t', fjfj)
+        self.declare_parameter('kp_t', 0.01)
+        self.declare_parameter('ki_t', 0.0)
+        self.declare_parameter('kd_t', 0.0)
 
-        # store parameters for speed
+        # store parameters for computing speed
         kp_r = self.get_parameter('kp_r').value
         ki_r = self.get_parameter('ki_r').value
         kd_r = self.get_parameter('kd_r').value
@@ -38,6 +40,8 @@ class RotateRobot(Node):
         kd_t = self.get_parameter('kd_t').value
         publish_period = 1/self.get_parameter('publish_frequency').value
         self.setpoint_t = self.get_parameter('distance_setpoint').value
+        self.max_speed_r = self.declare_parameter('max_speed_r').value
+        self.max_speed_t = self.declare_parameter('max_speed_t').value
 
         # set up PID controllers
         self.rotational_controller = PID_controller(kp_r, ki_r, kd_r, publish_period)
@@ -66,11 +70,25 @@ class RotateRobot(Node):
             msg.angular.z = 0.0
             msg.linear.x = 0.0
         else:
+            # get errors
             angle_err = math.atan2(self.y, self.x) # bounded from -pi to pi
             dist = math.sqrt(pow(self.x, 2) + pow(self.y, 2))
             dist_err = self.setpoint_t - dist
-            msg.linear.x = self.translational_controller.get_effort(dist_err)
-            msg.angular.z = self.rotational_controller.get_effort(angle_err)
+
+            # get effort from controllers
+            dist_effort = self.translational_controller.get_effort(dist_err)
+            angle_effort = self.rotational_controller.get_effort(angle_err)
+
+            # bound outputs
+            if abs(dist_effort) > self.max_speed_t:
+                msg.linear.x = math.copysign(self.max_speed_t, dist_effort)
+            else:
+                msg.linear.x = dist_effort
+
+            if abs(angle_effort) > self.max_speed_r:
+                msg.angular.z = math.copysign(self.max_speed_r, angle_effort)
+            else:
+                msg.angular.z = angle_effort
             
         self.publisher_.publish(msg)
 
