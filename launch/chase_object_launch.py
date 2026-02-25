@@ -18,10 +18,10 @@ def generate_launch_description():
             executable='chase_object',
             name='chase_object',
             parameters=[
-                {'kp_r' : 0.7},
+                {'kp_r' : 1.8},
                 {'ki_r' : 0.0},
                 {'kd_r' : 0.0},
-                {'kp_t' : 0.01},
+                {'kp_t' : 0.5},
                 {'ki_t' : 0.0},
                 {'kd_t' : 0.0},
             ]
