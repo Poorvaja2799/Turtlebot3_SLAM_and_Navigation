@@ -55,7 +55,7 @@ class RotateRobot(Node):
             depth=1)
 
         # set up publisher
-        self.publisher_ = self.create_publisher(Twist, '/cmd_vel', qos_profile)
+        self.publisher_ = self.create_publisher(Twist, '/cmd_vel', 10)
         self.timer = self.create_timer(publish_period, self.publisher_callback)
         
         # set up subscriber
