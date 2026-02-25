@@ -24,6 +24,9 @@ setup(
     },
     entry_points={
         'console_scripts': [
+            'chase_object=galactic_chase_object.chase_object:main',
+            'find_object=galactic_chase_object.find_object:main',
+            'get_object_range=galactic_chase_object.get_object_range:main',
         ],
     },
 )
