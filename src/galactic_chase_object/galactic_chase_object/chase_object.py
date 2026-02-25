@@ -40,8 +40,8 @@ class RotateRobot(Node):
         kd_t = self.get_parameter('kd_t').value
         publish_period = 1/self.get_parameter('publish_frequency').value
         self.setpoint_t = self.get_parameter('distance_setpoint').value
-        self.max_speed_r = self.declare_parameter('max_speed_r').value
-        self.max_speed_t = self.declare_parameter('max_speed_t').value
+        self.max_speed_r = self.get_parameter('max_speed_r').value
+        self.max_speed_t = self.get_parameter('max_speed_t').value
 
         # set up PID controllers
         self.rotational_controller = PID_controller(kp_r, ki_r, kd_r, publish_period)
