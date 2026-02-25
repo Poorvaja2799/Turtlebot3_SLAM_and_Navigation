@@ -73,7 +73,7 @@ class RotateRobot(Node):
             # get errors
             angle_err = math.atan2(self.y, self.x) # bounded from -pi to pi
             dist = math.sqrt(pow(self.x, 2) + pow(self.y, 2))
-            dist_err = self.setpoint_t - dist
+            dist_err = dist - self.setpoint_t
 
             # get effort from controllers
             dist_effort = self.translational_controller.get_effort(dist_err)
