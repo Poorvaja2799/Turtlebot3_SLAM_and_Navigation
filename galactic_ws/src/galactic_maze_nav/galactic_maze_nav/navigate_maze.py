@@ -1,0 +1,384 @@
+#!/usr/bin/env python3
+import math
+import time
+from pathlib import Path
+from dataclasses import dataclass
+
+import cv2
+import numpy as np
+import rclpy
+from ament_index_python.packages import get_package_share_directory
+from geometry_msgs.msg import Twist
+from std_msgs.msg import String
+from nav_msgs.msg import Odometry
+from rclpy.node import Node
+from rclpy.qos import QoSDurabilityPolicy, QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy
+from sensor_msgs.msg import CompressedImage, LaserScan
+from . import img_preprocessing
+
+
+
+LABEL_EMPTY = 0
+LABEL_LEFT = 1
+LABEL_RIGHT = 2
+LABEL_DO_NOT_ENTER = 3
+LABEL_STOP = 4
+LABEL_GOAL = 5
+
+
+def wrap_angle(angle):
+	while angle > math.pi:
+		angle -= 2.0 * math.pi
+	while angle < -math.pi:
+		angle += 2.0 * math.pi
+	return angle
+
+
+def quat_to_yaw(x, y, z, w):
+	siny_cosp = 2.0 * (w * z + x * y)
+	cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
+	return math.atan2(siny_cosp, cosy_cosp)
+
+
+class MazeNavigator(Node):
+	def __init__(self):
+		super().__init__('navigate_maze_node')
+
+		# Parameters
+		default_model_path = Path(get_package_share_directory('galactic_maze_nav')) / 'model.xml'
+		self.declare_parameter('model_path', str(default_model_path))
+		self.declare_parameter('knn_k', 7)
+		self.declare_parameter('linear_speed', 0.10)
+		self.declare_parameter('angular_speed', 0.6)
+		self.declare_parameter('wall_stop_dist', 0.55)
+		self.declare_parameter('wall_observe_max', 0.70)
+		self.declare_parameter('turn_tolerance_deg', 1.0)
+		self.declare_parameter('search_timeout_s', 8.0)
+		self.declare_parameter('kp', 0.005)
+		self.declare_parameter('ki', 0.0)
+		self.declare_parameter('kd', 0.0001)
+		self.declare_parameter('img_size_steering_threshold', 3000)
+		self.declare_parameter('img_steering_borders', 70)
+		self.declare_parameter('classification_angle_range', 50)
+
+		self.model_path = self.get_parameter('model_path').value
+		self.knn_k = int(self.get_parameter('knn_k').value)
+		self.linear_speed = float(self.get_parameter('linear_speed').value)
+		self.angular_speed = float(self.get_parameter('angular_speed').value)
+		self.wall_stop_dist = float(self.get_parameter('wall_stop_dist').value)
+		self.wall_observe_max = float(self.get_parameter('wall_observe_max').value)
+		self.turn_tolerance = math.radians(float(self.get_parameter('turn_tolerance_deg').value))
+		self.search_timeout = float(self.get_parameter('search_timeout_s').value)
+		self.pid = PID_controller(self.get_parameter('kp').value, self.get_parameter('ki').value, self.get_parameter('kd').value, 0.1)
+		self.img_size_steering_threshold = self.get_parameter('img_size_steering_threshold').value
+		self.img_steering_borders = self.get_parameter('img_steering_borders').value
+		self.classifiaction_angle_range = self.get_parameter('classification_angle_range').value
+
+		model = Path(self.model_path)
+		if not model.is_absolute():
+			model = (Path(__file__).resolve().parent / model).resolve()
+		if not model.exists():
+			raise FileNotFoundError(
+				f'KNN model not found: {model}. Pass --ros-args -p model_path:=<path_to_model.xml>'
+			)
+
+		self.get_logger().info(f'Loading KNN model: {model}')
+		self.knn = cv2.ml.KNearest_load(str(model))
+
+		sensor_qos = QoSProfile(
+			reliability=QoSReliabilityPolicy.BEST_EFFORT,
+			durability=QoSDurabilityPolicy.VOLATILE,
+			history=QoSHistoryPolicy.KEEP_LAST,
+			depth=1,
+		)
+
+		self.cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10)
+		self.state_pub = self.create_publisher(String, '/drive_state', 10)
+		self.scan_sub = self.create_subscription(LaserScan, '/scan', self.scan_callback, sensor_qos)
+		self.img_sub = self.create_subscription(CompressedImage, '/image_raw/compressed', self.image_callback, sensor_qos)
+		self.odom_sub = self.create_subscription(Odometry, '/odom', self.odom_callback, sensor_qos)
+
+		self.timer = self.create_timer(0.1, self.control_loop)
+
+		self.latest_scan = None
+		self.latest_image = None
+		self.current_yaw = None
+		self.first_yaw = None
+
+		self.state = 'DRIVE_TO_WALL'
+		self.turn_target_yaw = None
+		self.turn_rate_sign = 1.0
+		self.search_start_time = None
+
+		self.img_pos = None
+		self.label_list = list()
+
+
+		self.get_logger().info('navigate_maze node started')
+
+	def scan_callback(self, msg):
+		self.latest_scan = msg
+
+	def image_callback(self, msg):
+		arr = np.frombuffer(msg.data, dtype=np.uint8)
+		img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+		if img is not None:
+			x, y, w, h, _ = img_preprocessing.get_bounding_box(img)
+			if img_preprocessing.is_reasonable_box(w,h):
+				img = img[y:y + h, x:x + w]
+			self.latest_image = img
+			self.img_pos = (x, y, w, h)
+
+	def odom_callback(self, msg):
+		q = msg.pose.pose.orientation
+		self.current_yaw = quat_to_yaw(q.x, q.y, q.z, q.w)
+		if self.first_yaw is None:
+			self.first_yaw = self.current_yaw
+
+	def publish_cmd(self, linear_x=0.0, angular_z=0.0):
+		cmd = Twist()
+		cmd.linear.x = float(linear_x)
+		cmd.angular.z = float(angular_z)
+		self.cmd_pub.publish(cmd)
+
+	def min_range_around_angle(self, angle_rad, half_width_deg=12):
+		if self.latest_scan is None:
+			return float('inf')
+
+		scan = self.latest_scan
+		half_width = math.radians(half_width_deg)
+		mins = []
+		for i, rng in enumerate(scan.ranges):
+			if not math.isfinite(rng):
+				continue
+			beam_ang = scan.angle_min + i * scan.angle_increment
+			err = wrap_angle(beam_ang - angle_rad)
+			if abs(err) <= half_width:
+				mins.append(rng)
+
+		return min(mins) if mins else float('inf')
+
+	def front_distance(self):
+		return self.min_range_around_angle(0.0, half_width_deg=12)
+
+	def classify_sign(self):
+		if self.latest_image is None:
+			return (None, None)
+
+		img = self.latest_image
+
+		input_size = (25, 33)
+		resized = cv2.resize(img, input_size)
+		sample = resized.flatten().reshape(1, input_size[0] * input_size[1] * 3).astype(np.float32)
+		ret, _, neighbor_labels, _ = self.knn.findNearest(sample, int(self.knn_k))
+
+		# get confidence fraction
+		predicted_label = int(ret)
+		neighbors = neighbor_labels[0]
+
+		votes_for_winner = np.sum(neighbors == predicted_label)
+		confidence = votes_for_winner / self.knn_k
+		return (int(ret), confidence)
+
+	def start_turn(self, delta_rad):
+		if self.current_yaw is not None:
+			self.turn_target_yaw = self.nearest_cardinal_direction((self.current_yaw + delta_rad))
+		else:
+			self.turn_target_yaw = None
+
+		self.turn_rate_sign = 1.0 if delta_rad >= 0.0 else -1.0
+		self.state = 'TURNING'
+
+	def start_gather_data(self):
+		if self.current_yaw is None:
+			return
+		half_range = math.radians(self.classifiaction_angle_range) / 2.0
+		relative_angles = [-half_range, half_range, 0.0]
+		self.angle_goals = [wrap_angle(self.current_yaw + angle) for angle in relative_angles]
+		self.label_list.clear()
+		self.state = "GATHER_DATA"
+
+	def get_best_result(self, results_list):
+		best_label = -1
+		best_confidence = 0
+		for label in range(6):
+			curr_confidence = 0
+			for knn_label, confidence in results_list:
+				if knn_label == label:
+					curr_confidence += confidence
+			if curr_confidence > best_confidence:
+				best_label = label
+				best_confidence = curr_confidence
+
+		return best_label
+	
+	def nearest_cardinal_direction(self, angle):
+		if self.first_yaw is None:
+			return angle
+		cardinals = list(wrap_angle(self.first_yaw + ang) for ang in (0, math.pi/2, math.pi, 3*math.pi/2))
+
+		best_diff = 100
+		best_index = -1
+		for i, cardinal in enumerate(cardinals):
+			diff = abs(wrap_angle(angle - cardinal))
+			if diff < best_diff:
+				best_diff = diff
+				best_index = i
+		return cardinals[best_index]
+		
+
+
+	def control_loop(self):
+		if self.latest_scan is None:
+			self.publish_cmd(0.0, 0.0)
+			return
+
+		self.state_pub.publish(String(data=self.state))
+
+		d_front = self.front_distance()
+
+		if self.state == 'DONE':
+			self.get_logger().info('Navigation complete. Stopping.')
+			self.publish_cmd(0.0, 0.0)
+			return
+
+		if self.state == 'DRIVE_TO_WALL':
+			if d_front <= self.wall_stop_dist:
+				self.publish_cmd(0.0, 0.0)
+				self.start_gather_data()
+			else:
+				# steer towards objects
+				angular_effort = 0.0
+				if self.img_pos is not None:
+					# check if size is within threshold
+					if img_preprocessing.is_reasonable_box(self.img_pos[2], self.img_pos[3], min_area = self.img_size_steering_threshold):
+						pixel_error = 160 - (self.img_pos[0] + self.img_pos[2]/2) # 320 pix wide camera resolution
+						# check if the image is relatively centered
+						if abs(pixel_error) < 160 - self.img_steering_borders:
+							angular_effort = self.pid.get_effort(pixel_error)
+				self.get_logger().info(f'Driving to wall. Front distance: {d_front:.2f} m, angular effort: {angular_effort:.2f}')
+				self.publish_cmd(self.linear_speed, angular_effort)
+				# self.publish_cmd(self.linear_speed, 0.0)
+			return
+		
+		if self.state == 'GATHER_DATA':
+			# use start_gather_data to enter this state
+
+			# exit if all angle goals have been reached
+			if len(self.angle_goals) == 0:
+				self.state = 'CLASSIFY'
+				return
+
+			# turn to current angle goal
+			if self.current_yaw is not None:
+				err = wrap_angle(self.angle_goals[0] - self.current_yaw)
+				if abs(err) <= self.turn_tolerance:
+					self.publish_cmd(0.0, 0.0)
+					label, confidence = self.classify_sign() # label, confidence
+					if label is not None:
+						self.label_list.append((label, confidence))
+					self.angle_goals.pop(0)
+				else:
+					direction = 1.0 if err > 0.0 else -1.0
+					self.publish_cmd(0.0, direction * self.angular_speed/2.0)
+
+			self.get_logger().info(f'Gathering image data')
+			return
+
+		if self.state == 'CLASSIFY':
+			self.publish_cmd(0.0, 0.0)
+			time.sleep(1)
+
+			if d_front > self.wall_observe_max:
+				self.state = 'DRIVE_TO_WALL'
+				return
+
+			if len(self.label_list) == 0:
+				self.get_logger().info('No valid gathered labels. Turning left.')
+				self.start_turn(math.pi / 2.0)
+				return
+
+			#3 get weighted mode of results list
+
+			label = self.get_best_result(self.label_list)
+			self.get_logger().info(f'Classifying sign at wall.\nBased on {len(self.label_list)} images, classified as {label}')
+
+			if label == LABEL_GOAL:
+				self.get_logger().info('GOAL sign detected. Stopping.')
+				self.state = 'DONE'
+				return
+
+			if label == LABEL_LEFT:
+				self.get_logger().info('LEFT sign detected.')
+				self.start_turn(math.pi / 2.0)
+				return
+
+			if label == LABEL_RIGHT:
+				self.get_logger().info('RIGHT sign detected.')
+				self.start_turn(-math.pi / 2.0)
+				return
+
+			if label in (LABEL_DO_NOT_ENTER, LABEL_STOP):
+				self.get_logger().info('DO NOT ENTER or STOP sign detected.')
+				self.start_turn(math.pi)
+				return
+
+			# Empty / unknown
+			self.start_turn(math.pi / 2.0) # just go left
+			self.get_logger().info('No recognizable sign found. Turned left.')
+			return
+
+		if self.state == 'TURNING':
+			# Prefer odom-based turn completion if odom is available
+			if self.current_yaw is not None and self.turn_target_yaw is not None:
+				err = wrap_angle(self.turn_target_yaw - self.current_yaw)
+				if abs(err) <= self.turn_tolerance:
+					self.publish_cmd(0.0, 0.0)
+					self.state = 'DRIVE_TO_WALL'
+				else:
+					direction = 1.0 if err > 0.0 else -1.0
+					self.publish_cmd(0.0, direction * self.angular_speed)
+			else:
+				# odom unavailable fallback: keep turning slowly until wall is seen again
+				self.publish_cmd(0.0, self.turn_rate_sign * self.angular_speed)
+				if d_front <= self.wall_observe_max:
+					self.publish_cmd(0.0, 0.0)
+					self.state = 'DRIVE_TO_WALL'
+			return
+
+@dataclass
+class PID_controller:
+    # implements a PID controller with a fixed period
+    kp: float
+    ki: float
+    kd: float
+    period: float
+
+    def __post_init__(self):
+        self.reset()
+
+    def get_effort(self, error):
+        self.error_sum += error
+        output = self.kp*error + self.ki*self.error_sum*self.period + self.kd*(error-self.prev_error)/self.period
+        self.prev_error = error
+        return output
+    
+    def reset(self):
+        self.error_sum = 0.0
+        self.prev_error = 0.0
+
+def main(args=None):
+	rclpy.init(args=args)
+	node = MazeNavigator()
+	try:
+		rclpy.spin(node)
+	except KeyboardInterrupt:
+		pass
+	finally:
+		node.publish_cmd(0.0, 0.0)
+		node.destroy_node()
+		rclpy.shutdown()
+
+
+if __name__ == '__main__':
+	main()
